@@ -4,12 +4,53 @@ Based on the LangChain SQL agent tutorial.
 """
 
 import os
+import re
 from typing import Optional
 from langchain.chat_models import init_chat_model
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_agent
 from document_store import DocumentStore
+
+
+class LoggingSQLDatabase(SQLDatabase):
+    """Wrapper around SQLDatabase that logs all SQL queries."""
+    
+    def _log_query(self, command: str):
+        """Helper method to log SQL queries."""
+        print(f"\n🔍 Executing SQL Query on 'ot_cdc' database:")
+        print(f"   {command}")
+        print()
+    
+    def run(self, command: str, fetch: str = "all", **kwargs) -> str:
+        """
+        Execute SQL command and log it.
+        
+        Args:
+            command: SQL command to execute
+            fetch: How to fetch results ('all', 'one', 'cursor')
+            **kwargs: Additional arguments passed to parent run method
+            
+        Returns:
+            Query results
+        """
+        self._log_query(command)
+        return super().run(command, fetch=fetch, **kwargs)
+    
+    def run_no_throw(self, command: str, fetch: str = "all", **kwargs) -> str:
+        """
+        Execute SQL command without throwing exceptions, and log it.
+        
+        Args:
+            command: SQL command to execute
+            fetch: How to fetch results ('all', 'one', 'cursor')
+            **kwargs: Additional arguments passed to parent run_no_throw method
+            
+        Returns:
+            Query results or error message
+        """
+        self._log_query(command)
+        return super().run_no_throw(command, fetch=fetch, **kwargs)
 
 
 class SQLAgent:
@@ -41,9 +82,50 @@ class SQLAgent:
     def _initialize(self):
         """Initialize the database connection and agent."""
         try:
-            # Initialize the database connection
+            # Initialize the database connection with limited schema info to save tokens
             print(f"🔗 Connecting to database: {self.database_url}")
-            self.db = SQLDatabase.from_uri(self.database_url)
+            
+            # Try to limit to commonly used tables to reduce context size
+            # Start with ordhdr (order header) which is the primary table
+            common_tables = ["ordhdr"]  # Add more tables here if needed
+            
+            try:
+                # First, get all available tables
+                temp_db = SQLDatabase.from_uri(self.database_url)
+                all_tables = temp_db.get_usable_table_names()
+                
+                # If we have many tables, try to limit to common ones plus a few others
+                # This helps reduce the schema size in the context
+                if len(all_tables) > 10:
+                    # Use include_tables to limit schema to most common tables
+                    # This significantly reduces token usage
+                    include_tables = common_tables + [t for t in all_tables if t.startswith("ord")][:5]
+                    # Use LoggingSQLDatabase to log queries - create base DB then wrap it
+                    base_db = SQLDatabase.from_uri(
+                        self.database_url,
+                        include_tables=include_tables,
+                        sample_rows_in_table_info=0,
+                    )
+                    # Create logging wrapper by copying attributes
+                    self.db = LoggingSQLDatabase.from_uri(
+                        self.database_url,
+                        include_tables=include_tables,
+                        sample_rows_in_table_info=0,
+                    )
+                    print(f"⚠️  Limited to {len(include_tables)} tables to reduce context size")
+                else:
+                    # If we have few tables, include all of them
+                    # Use LoggingSQLDatabase to log queries
+                    self.db = LoggingSQLDatabase.from_uri(
+                        self.database_url,
+                        sample_rows_in_table_info=0,
+                    )
+            except Exception:
+                # Fallback: include all tables if limiting fails
+                self.db = LoggingSQLDatabase.from_uri(
+                    self.database_url,
+                    sample_rows_in_table_info=0,
+                )
             
             # Initialize the document store for query history and semantic search
             print("🧠 Initializing document store...")
@@ -57,40 +139,57 @@ class SQLAgent:
             toolkit = SQLDatabaseToolkit(db=self.db, llm=self.model)
             tools = toolkit.get_tools()
             
-            # Create the system prompt with metadata context
-            system_prompt = """
-You are an agent designed to interact with a MySQL database called 'ot_cdc'.
-Given an input question, create a syntactically correct MySQL query to run,
-then look at the results of the query and return the answer. Unless the user
-specifies a specific number of examples they wish to obtain, always limit your
-query to at most {top_k} results.
+            # Sanitize tool names to match OpenAI's function name pattern (^[a-zA-Z0-9_-]+$)
+            # OpenAI requires function names to only contain alphanumeric, underscore, and hyphen
+            def sanitize_function_name(name: str) -> str:
+                """Sanitize function name to match OpenAI's pattern."""
+                if not name:
+                    return "unnamed_tool"
+                # Replace any characters that aren't alphanumeric, underscore, or hyphen
+                sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+                # Remove consecutive underscores
+                sanitized = re.sub(r'_+', '_', sanitized)
+                # Ensure it doesn't start with a number or hyphen
+                if sanitized and (sanitized[0].isdigit() or sanitized[0] == '-'):
+                    sanitized = 'tool_' + sanitized
+                # Ensure it doesn't end with underscore or hyphen
+                sanitized = sanitized.rstrip('_-')
+                # Ensure it's not empty
+                if not sanitized:
+                    sanitized = "unnamed_tool"
+                return sanitized
+            
+            for tool in tools:
+                if hasattr(tool, 'name'):
+                    original_name = tool.name
+                    sanitized_name = sanitize_function_name(original_name)
+                    
+                    if sanitized_name != original_name:
+                        tool.name = sanitized_name
+                        # Update function name if it exists
+                        if hasattr(tool, 'func') and hasattr(tool.func, '__name__'):
+                            tool.func.__name__ = sanitized_name
+                        # Update any internal references
+                        if hasattr(tool, '_name'):
+                            tool._name = sanitized_name
+                        # Update binding if it exists (for structured tools)
+                        if hasattr(tool, 'binding') and hasattr(tool.binding, 'function'):
+                            if hasattr(tool.binding.function, 'name'):
+                                tool.binding.function.name = sanitized_name
+                        # Update args_schema title if it exists
+                        try:
+                            if hasattr(tool, 'args_schema') and tool.args_schema:
+                                if hasattr(tool.args_schema, 'schema'):
+                                    schema = tool.args_schema.schema()
+                                    if isinstance(schema, dict) and 'title' in schema:
+                                        schema['title'] = sanitized_name
+                        except Exception:
+                            pass  # Ignore errors when accessing schema
+            
+            # Create minimal system prompt to save tokens
+            system_prompt = """You are a MySQL agent for 'ot_cdc' database. Create correct queries, execute them, return answers.
 
-You can order the results by a relevant column to return the most interesting
-examples in the database. Never query for all the columns from a specific table,
-only ask for the relevant columns given the question.
-
-You MUST double check your query before executing it. If you get an error while
-executing a query, rewrite the query and try again.
-
-DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the
-database.
-
-To start you should ALWAYS look at the tables in the database to see what you
-can query. Do NOT skip this step.
-
-Then you should query the schema of the most relevant tables.
-
-The database contains business data including order headers (ordhdr table) and 
-related tables. You can learn from previous successful queries stored in the
-document store to improve your responses.
-
-If the user asks about data they don't have access to, politely inform them
-that you can only query the available database tables and suggest they check
-their permissions or contact their administrator.
-
-Use the document store to find similar queries and learn from successful
-query patterns to generate better SQL queries.
-""".format(
+Rules: Limit to {top_k} results. Query only relevant columns. Check tables/schemas first. Verify queries before execution. NO DML (INSERT/UPDATE/DELETE/DROP).""".format(
                 top_k=10,
             )
             
@@ -117,19 +216,47 @@ query patterns to generate better SQL queries.
             Formatted response with the query results
         """
         try:
-            # First, look for similar queries in the document store
-            similar_queries = []
-            if self.document_store:
-                similar_queries = self.document_store.search_similar_queries(question, limit=3)
-            
-            # Enhance the question with context from similar queries
+            # Search for relevant documentation to guide query generation
+            # This helps the agent use proper SQL patterns from the documentation
             enhanced_question = question
-            if similar_queries:
-                context = "\n\nSimilar successful queries:\n"
-                for similar in similar_queries:
-                    if similar["success"]:
-                        context += f"- Query: {similar['query']}\n  SQL: {similar['sql_query']}\n"
-                enhanced_question = question + context
+            doc_context = ""
+            
+            if self.document_store:
+                # Search for relevant documentation (not query history)
+                relevant_docs = self.document_store.search_documentation(question, limit=1)
+                
+                if relevant_docs:
+                    doc = relevant_docs[0]
+                    # Extract SQL examples from the documentation content
+                    import re
+                    content = doc.get("content", "")
+                    
+                    # Try to find SQL in code blocks first
+                    sql_examples = re.findall(r'```sql\s*\n(.*?)\n```', content, re.DOTALL)
+                    if not sql_examples:
+                        # Try without language tag
+                        sql_examples = re.findall(r'```\s*\n(.*?)\n```', content, re.DOTALL)
+                    if not sql_examples:
+                        # Try to find SQL queries without code blocks (multi-line SELECT)
+                        sql_examples = re.findall(r'(SELECT[\s\S]*?;)', content, re.IGNORECASE)
+                    
+                    if sql_examples:
+                        # Use the most relevant SQL example (prefer shorter, more focused ones)
+                        # Sort by length and take a medium-sized one (not too short, not too long)
+                        sql_examples.sort(key=len)
+                        best_example = None
+                        for example in sql_examples:
+                            # Prefer examples that are 100-400 chars (good balance)
+                            if 100 <= len(example) <= 400:
+                                best_example = example
+                                break
+                        if not best_example:
+                            # Fall back to first example, truncated
+                            best_example = sql_examples[0][:400]
+                        
+                        doc_title = doc.get("title", "Documentation")
+                        doc_context = f"\n\nUse this SQL pattern from {doc_title} as a guide:\n```sql\n{best_example.strip()}\n```"
+                        enhanced_question = question + doc_context
             
             # Run the agent with the enhanced question
             response = self.agent.invoke({"messages": [{"role": "user", "content": enhanced_question}]})
@@ -149,7 +276,20 @@ query patterns to generate better SQL queries.
                 return "I couldn't process your question. Please try rephrasing it."
                 
         except Exception as e:
-            error_msg = f"Error processing your question: {str(e)}"
+            error_str = str(e)
+            
+            # Handle context length errors with helpful message
+            if "context_length_exceeded" in error_str or "maximum context length" in error_str.lower():
+                error_msg = """The database schema is too large for the current model context. 
+
+Try:
+1. Ask about a specific table (e.g., 'Show orders from ordhdr table')
+2. Use 'tables' command to see available tables first
+3. Ask more specific questions about fewer tables at once
+
+The database has many tables with detailed schemas that exceed the token limit."""
+            else:
+                error_msg = f"Error processing your question: {error_str}"
             
             # Store failed query for learning
             if self.document_store:

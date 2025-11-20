@@ -157,22 +157,111 @@ class DocumentStore:
             
             # Format results
             formatted_results = []
+            if not results or len(results) == 0:
+                return []
+            
             for result in results[0]:  # results is a list of lists
-                formatted_results.append({
-                    "query": result["entity"]["query"],
-                    "sql_query": result["entity"]["sql_query"],
-                    "result": result["entity"]["result"],
-                    "success": result["entity"]["success"],
-                    "timestamp": result["entity"]["timestamp"],
-                    "doc_type": result["entity"]["doc_type"],
-                    "similarity_score": result["score"]
-                })
+                try:
+                    # Handle different Milvus result structures
+                    # Score might be in result["distance"] or result["score"]
+                    similarity_score = 0.0
+                    if "distance" in result:
+                        similarity_score = result["distance"]
+                    elif "score" in result:
+                        similarity_score = result["score"]
+                    
+                    # Handle entity data - might be nested or flat
+                    entity_data = result.get("entity", result)
+                    if not isinstance(entity_data, dict):
+                        entity_data = result
+                    
+                    formatted_results.append({
+                        "query": entity_data.get("query", ""),
+                        "sql_query": entity_data.get("sql_query", ""),
+                        "result": entity_data.get("result", ""),
+                        "success": entity_data.get("success", True),
+                        "timestamp": entity_data.get("timestamp", ""),
+                        "doc_type": entity_data.get("doc_type", "query_history"),
+                        "similarity_score": similarity_score
+                    })
+                except (KeyError, TypeError) as e:
+                    # Skip malformed results
+                    print(f"⚠️  Skipping malformed search result: {e}")
+                    continue
             
             return formatted_results
             
         except Exception as e:
             print(f"❌ Error searching similar queries: {e}")
             return []
+    
+    def search_documentation(self, query: str, limit: int = 2) -> List[Dict[str, Any]]:
+        """
+        Search for relevant documentation (not query history).
+        
+        Args:
+            query: Natural language query to search for
+            limit: Maximum number of results
+            
+        Returns:
+            List of relevant documentation with SQL examples
+        """
+        try:
+            # Generate embedding for the query
+            query_embedding = self._get_embedding(query)
+            
+            # Search in Milvus (get more results to filter manually)
+            results = self.client.search(
+                collection_name=self.collection_name,
+                data=[query_embedding],
+                limit=limit * 3,  # Get more to filter
+                output_fields=["query", "sql_query", "result", "success", "timestamp", "doc_type"]
+            )
+            
+            # Format results
+            formatted_results = []
+            if not results or len(results) == 0:
+                return []
+            
+            for result in results[0]:  # results is a list of lists
+                try:
+                    entity_data = result.get("entity", result)
+                    if not isinstance(entity_data, dict):
+                        entity_data = result
+                    
+                    # Only include documentation, not query history
+                    doc_type = entity_data.get("doc_type", "")
+                    if doc_type == "query_history":
+                        continue
+                    
+                    similarity_score = 0.0
+                    if "distance" in result:
+                        similarity_score = result["distance"]
+                    elif "score" in result:
+                        similarity_score = result["score"]
+                    
+                    formatted_results.append({
+                        "title": entity_data.get("query", ""),  # Title is stored in "query" field for docs
+                        "content": entity_data.get("result", ""),  # Content is stored in "result" field for docs
+                        "doc_type": doc_type,
+                        "similarity_score": similarity_score
+                    })
+                    
+                    if len(formatted_results) >= limit:
+                        break
+                        
+                except (KeyError, TypeError) as e:
+                    continue
+            
+            return formatted_results
+            
+        except Exception as e:
+            # If filter doesn't work, fall back to regular search and filter manually
+            try:
+                all_results = self.search_similar_queries(query, limit=limit * 2)
+                return [r for r in all_results if r.get("doc_type") != "query_history"][:limit]
+            except Exception:
+                return []
     
     def get_query_suggestions(self, partial_query: str) -> List[str]:
         """
@@ -282,11 +371,26 @@ class DocumentStore:
         """Get statistics about stored documents."""
         try:
             # Query all documents to get stats
-            results = self.client.query(
-                collection_name=self.collection_name,
-                filter='',  # Get all documents
-                output_fields=["doc_type", "success"]
-            )
+            # Milvus requires a filter with limit, so we'll use a filter that matches everything
+            # Try to get all documents by using a filter that's always true
+            try:
+                results = self.client.query(
+                    collection_name=self.collection_name,
+                    filter='doc_type in ["query_history", "document", "table_documentation", "database_documentation"]',
+                    output_fields=["doc_type", "success"],
+                    limit=10000
+                )
+            except Exception:
+                # If filter doesn't work, try without filter but with limit
+                try:
+                    results = self.client.query(
+                        collection_name=self.collection_name,
+                        output_fields=["doc_type", "success"],
+                        limit=10000
+                    )
+                except Exception:
+                    # If that fails, return empty stats
+                    return {"total_documents": 0, "query_history": 0, "documents": 0, "successful_queries": 0, "failed_queries": 0}
             
             stats = {
                 "total_documents": len(results),

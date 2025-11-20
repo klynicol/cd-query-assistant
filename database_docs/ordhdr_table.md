@@ -7,13 +7,9 @@ The `ordhdr` table is the main order header table containing primary order infor
 This table stores the core order data including order identification, customer information, order dates, status, and financial details.
 
 ## Key Fields
-- **Order ID**: Primary key for identifying orders
-- **Customer ID**: Links to customer information
-- **Order Date**: When the order was placed
-- **Order Status**: Current status of the order (pending, completed, cancelled, etc.)
-- **Total Amount**: Total value of the order
-- **Created Date**: When the order record was created
-- **Updated Date**: When the order was last modified
+- **ordID**: Primary key for identifying orders
+- **custID**: Links to customer information
+- **ordDate**: When the order was placed
 
 ## Business Context
 - Orders represent customer purchases and transactions
@@ -36,14 +32,30 @@ This table stores the core order data including order identification, customer i
 ## Sample Queries
 ```sql
 -- Recent orders
-SELECT * FROM ordhdr WHERE order_date >= CURDATE() - INTERVAL 30 DAY;
+SELECT * FROM ordhdr WHERE ordDate >= CURDATE() - INTERVAL 30 DAY;
 
--- Orders by status
-SELECT status, COUNT(*) as count FROM ordhdr GROUP BY status;
+-- ============================================================================
+-- Get order status using ordhdr.lastTrackID (most recent track entry)
+-- This uses the lastTrackID field which points to the most recent track entry
+-- ============================================================================
+SELECT 
+    oh.ordNum,
+    oh.ordID,
+    m.mileID,
+    m.mileDesc,
+    m.publicDesc AS orderStatus,
+    m.shortDesc,
+    t.lastDateTime AS statusDateTime
+FROM ordhdr oh
+LEFT JOIN track t ON t.trackID = oh.lastTrackID
+LEFT JOIN mile m ON t.mileID = m.mileID
+WHERE oh.ordNum = 416328;   -- Replace with your order number / SWO (sales work order)
 
 -- Top customers by order value
-SELECT customer_id, SUM(total_amount) as total 
-FROM ordhdr 
-GROUP BY customer_id 
-ORDER BY total DESC;
+SELECT c.custName, c.custID, SUM(o.ordTotal) as total 
+FROM ordhdr o
+JOIN cust c
+on c.custID = o.custID 
+GROUP BY custID
+ORDER BY SUM(o.ordTotal) DESC;
 ```
